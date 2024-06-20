@@ -14,6 +14,7 @@
 #include "vm/Array.h"
 #include "vm/MetadataLock.h"
 #include "vm/MetadataCache.h"
+#include "vm/MetadataAlloc.h"
 #include "vm/String.h"
 #include "vm/Reflection.h"
 #include "metadata/FieldLayout.h"
@@ -37,25 +38,52 @@ namespace hybridclr
 namespace metadata
 {
 
-	uint32_t InterpreterImage::s_cliImageCount = 0;
-	InterpreterImage* InterpreterImage::s_images[kMaxLoadImageCount + 1] = {};
+	static uint32_t s_nextImageIndexByKind[4] = { (1u << kMetadataImageIndexExtraShiftBitsA), 0, 0, 0};
+
+	InterpreterImage* InterpreterImage::s_images[kMaxMetadataImageCount] = {};
+
+	static int32_t GetImageKindByDllLength(uint32_t dllLength)
+	{
+		uint32_t maxPossibleIndexValue = dllLength * 4;
+		for (int32_t i = 3; i >= 0; i--)
+		{
+			if (maxPossibleIndexValue <= kMetadataIndexMaskArr[i])
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
 
 	void InterpreterImage::Initialize()
 	{
-		s_cliImageCount = 0;
-		std::memset(s_images, 0, sizeof(Assembly*) * (kMaxLoadImageCount + 1));
+		
 	}
 
-	uint32_t InterpreterImage::AllocImageIndex()
+	uint32_t InterpreterImage::AllocImageIndex(uint32_t dllLength)
 	{
-		il2cpp::os::FastAutoLock lock(&il2cpp::vm::g_MetadataLock);
-		return ++s_cliImageCount;
+		int32_t kind = GetImageKindByDllLength(dllLength);
+		if (kind < 0)
+		{
+			return kInvalidImageIndex;
+		}
+		for (int32_t finalKind = kind; finalKind >= 0; finalKind--)
+		{
+			uint32_t newImageIndex = s_nextImageIndexByKind[finalKind];
+			// 255 is preserved for invalid image index when kind is 3
+			if (newImageIndex >= kMaxMetadataImageIndexWithoutKind - (finalKind == 3))
+			{
+				continue;
+			}
+			s_nextImageIndexByKind[finalKind] += (1u << kMetadataImageIndexExtraShiftBitsArr[finalKind]);
+			return newImageIndex | ((uint32_t)finalKind << (kMetadataImageIndexBits - kMetadataKindBits));
+		}
+		return kInvalidImageIndex;
 	}
 
 	void InterpreterImage::RegisterImage(InterpreterImage* image)
 	{
 		il2cpp::os::Atomic::FullMemoryBarrier();
-		il2cpp::os::FastAutoLock lock(&il2cpp::vm::g_MetadataLock);
 		IL2CPP_ASSERT(image->GetIndex() > 0);
 		s_images[image->GetIndex()] = image;
 	}
@@ -70,9 +98,9 @@ namespace metadata
 	{
 		ass->token = EncodeToken(TableType::ASSEMBLY, 1);
 		ass->referencedAssemblyStart = EncodeWithIndex(1);
-		ass->referencedAssemblyCount = _rawImage.GetTableRowNum(TableType::ASSEMBLYREF);
+		ass->referencedAssemblyCount = _rawImage->GetTableRowNum(TableType::ASSEMBLYREF);
 
-		TbAssembly data = _rawImage.ReadAssembly(1);
+		TbAssembly data = _rawImage->ReadAssembly(1);
 		auto& aname = ass->aname;
 		aname.hash_alg = data.hashAlgId;
 		aname.major = data.majorVersion;
@@ -80,24 +108,31 @@ namespace metadata
 		aname.build = data.buildNumber;
 		aname.revision = data.revisionNumber;
 		aname.flags = data.flags;
-		aname.public_key = _rawImage.GetBlobFromRawIndex(data.publicKey);
-		aname.name = _rawImage.GetStringFromRawIndex(data.name);
-		aname.culture = _rawImage.GetStringFromRawIndex(data.culture);
+		aname.public_key = _rawImage->GetBlobFromRawIndex(data.publicKey);
+		aname.name = _rawImage->GetStringFromRawIndex(data.name);
+		aname.culture = _rawImage->GetStringFromRawIndex(data.culture);
 	}
 
 	void InterpreterImage::BuildIl2CppImage(Il2CppImage* image2)
 	{
-		image2->typeCount = _rawImage.GetTableRowNum(TableType::TYPEDEF);
-		image2->exportedTypeCount = _rawImage.GetTableRowNum(TableType::EXPORTEDTYPE);
-		image2->customAttributeCount = _rawImage.GetTableRowNum(TableType::CUSTOMATTRIBUTE);
+		image2->typeCount = _rawImage->GetTableRowNum(TableType::TYPEDEF);
+		image2->exportedTypeCount = _rawImage->GetTableRowNum(TableType::EXPORTEDTYPE);
+		image2->customAttributeCount = _rawImage->GetTableRowNum(TableType::CUSTOMATTRIBUTE);
 
-		Il2CppImageGlobalMetadata* metadataImage = (Il2CppImageGlobalMetadata*)IL2CPP_MALLOC_ZERO(sizeof(Il2CppImageGlobalMetadata));
+#if HYBRIDCLR_UNITY_2019
+		image2->typeStart = EncodeWithIndex(0);
+		image2->customAttributeStart = EncodeWithIndex(0);
+		image2->entryPointIndex = EncodeWithIndexExcept0(_rawImage->GetEntryPointToken());
+		image2->exportedTypeStart = EncodeWithIndex(0);
+#else
+		Il2CppImageGlobalMetadata* metadataImage = (Il2CppImageGlobalMetadata*)HYBRIDCLR_METADATA_MALLOC(sizeof(Il2CppImageGlobalMetadata));
 		metadataImage->typeStart = EncodeWithIndex(0);
 		metadataImage->customAttributeStart = EncodeWithIndex(0);
-		metadataImage->entryPointIndex = EncodeWithIndexExcept0(_rawImage.GetEntryPointToken());
+		metadataImage->entryPointIndex = EncodeWithIndexExcept0(_rawImage->GetEntryPointToken());
 		metadataImage->exportedTypeStart = EncodeWithIndex(0);
 		metadataImage->image = image2;
 		image2->metadataHandle = reinterpret_cast<Il2CppMetadataImageHandle>(metadataImage);
+#endif
 
 		image2->nameToClassHashTable = nullptr;
 		image2->codeGenModule = nullptr;
@@ -108,7 +143,7 @@ namespace metadata
 
 	void InterpreterImage::InitRuntimeMetadatas()
 	{
-		IL2CPP_ASSERT(_rawImage.GetTable(TableType::EXPORTEDTYPE).rowNum == 0);
+		IL2CPP_ASSERT(_rawImage->GetTable(TableType::EXPORTEDTYPE).rowNum == 0);
 
 		InitGenericParamDefs0();
 		InitTypeDefs_0();
@@ -140,7 +175,7 @@ namespace metadata
 
 	void InterpreterImage::InitTypeDefs_0()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 		_typesDefines.resize(typeDefTb.rowNum);
 		_typeDetails.resize(typeDefTb.rowNum);
 		for (uint32_t i = 0, n = typeDefTb.rowNum; i < n; i++)
@@ -152,7 +187,7 @@ namespace metadata
 			typeDetail.typeSizes = {};
 
 			uint32_t rowIndex = i + 1;
-			TbTypeDef data = _rawImage.ReadTypeDef(rowIndex);
+			TbTypeDef data = _rawImage->ReadTypeDef(rowIndex);
 
 			cur = {};
 
@@ -168,6 +203,11 @@ namespace metadata
 			SET_IL2CPPTYPE_VALUE_TYPE(cppType, isValueType);
 			cppType.data.typeHandle = (Il2CppMetadataTypeHandle)&cur;
 			cur.byvalTypeIndex = AddIl2CppTypeCache(cppType);
+#if HYBRIDCLR_UNITY_2019
+			Il2CppType byRefType = cppType;
+			byRefType.byref = 1;
+			cur.byrefTypeIndex = AddIl2CppTypeCache(byRefType);
+#endif
 
 			if (IsInterface(cur.flags))
 			{
@@ -188,13 +228,13 @@ namespace metadata
 
 	void InterpreterImage::InitTypeDefs_1()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 		for (uint32_t i = 0, n = typeDefTb.rowNum; i < n; i++)
 		{
 			Il2CppTypeDefinition& last = _typesDefines[i > 0 ? i - 1 : 0];
 			Il2CppTypeDefinition& cur = _typesDefines[i];
 			uint32_t rowIndex = i + 1;
-			TbTypeDef data = _rawImage.ReadTypeDef(rowIndex); // token from 1
+			TbTypeDef data = _rawImage->ReadTypeDef(rowIndex); // token from 1
 
 			cur.flags = data.flags;
 			cur.nameIndex = EncodeWithIndex(data.typeName);
@@ -210,8 +250,8 @@ namespace metadata
 			}
 			if (i == n - 1)
 			{
-				cur.field_count = (uint16_t)(_rawImage.GetTableRowNum(TableType::FIELD) - DecodeMetadataIndex(cur.fieldStart));
-				cur.method_count = (uint16_t)(_rawImage.GetTableRowNum(TableType::METHOD) - DecodeMetadataIndex(cur.methodStart));
+				cur.field_count = (uint16_t)(_rawImage->GetTableRowNum(TableType::FIELD) - DecodeMetadataIndex(cur.fieldStart));
+				cur.method_count = (uint16_t)(_rawImage->GetTableRowNum(TableType::METHOD) - DecodeMetadataIndex(cur.methodStart));
 			}
 
 			if (data.extends != 0)
@@ -251,11 +291,11 @@ namespace metadata
 
 	void InterpreterImage::InitTypeDefs_2()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 
 		for (uint32_t i = 0, n = typeDefTb.rowNum; i < n; i++)
 		{
-			TbTypeDef data = _rawImage.ReadTypeDef(i + 1); // token from 1
+			TbTypeDef data = _rawImage->ReadTypeDef(i + 1); // token from 1
 
 			Il2CppTypeDefinition& last = _typesDefines[i > 0 ? i - 1 : 0];
 			Il2CppTypeDefinition& cur = _typesDefines[i];
@@ -291,7 +331,7 @@ namespace metadata
 
 	void InterpreterImage::InitParamDefs()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::PARAM);
+		const Table& tb = _rawImage->GetTable(TableType::PARAM);
 
 		// extra 16 for not name params
 		_params.reserve(tb.rowNum + 16);
@@ -300,7 +340,7 @@ namespace metadata
 		//{
 		//	uint32_t rowIndex = i + 1;
 		//	Il2CppParameterDefinition& pd = _params[i].paramDef;
-		//	TbParam data = _rawImage.ReadParam(rowIndex);
+		//	TbParam data = _rawImage->ReadParam(rowIndex);
 
 		//	pd.nameIndex = EncodeWithIndex(data.name);
 		//	pd.token = EncodeToken(TableType::PARAM, rowIndex);
@@ -311,7 +351,7 @@ namespace metadata
 
 	void InterpreterImage::InitFieldDefs()
 	{
-		const Table& fieldTb = _rawImage.GetTable(TableType::FIELD);
+		const Table& fieldTb = _rawImage->GetTable(TableType::FIELD);
 		_fieldDetails.resize(fieldTb.rowNum);
 
 		for (size_t i = 0; i < _typesDefines.size(); i++)
@@ -334,9 +374,9 @@ namespace metadata
 			fd.defaultValueIndex = kDefaultValueIndexNull;
 
 			uint32_t rowIndex = i + 1;
-			TbField data = _rawImage.ReadField(rowIndex);
+			TbField data = _rawImage->ReadField(rowIndex);
 
-			BlobReader br = _rawImage.GetBlobReaderByRawIndex(data.signature);
+			BlobReader br = _rawImage->GetBlobReaderByRawIndex(data.signature);
 			FieldRefSig frs;
 			ReadFieldRefSig(br, GetGenericContainerByTypeDefRawIndex(DecodeMetadataIndex(fd.typeDefIndex)), frs);
 			frs.type.attrs = data.flags;
@@ -350,20 +390,20 @@ namespace metadata
 
 	void InterpreterImage::InitFieldLayouts()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::FIELDLAYOUT);
+		const Table& tb = _rawImage->GetTable(TableType::FIELDLAYOUT);
 		for (uint32_t i = 0; i < tb.rowNum; i++)
 		{
-			TbFieldLayout data = _rawImage.ReadFieldLayout(i + 1);
+			TbFieldLayout data = _rawImage->ReadFieldLayout(i + 1);
 			_fieldDetails[data.field - 1].offset = sizeof(Il2CppObject) + data.offset;
 		}
 	}
 
 	void InterpreterImage::InitFieldRVAs()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::FIELDRVA);
+		const Table& tb = _rawImage->GetTable(TableType::FIELDRVA);
 		for (uint32_t i = 0; i < tb.rowNum; i++)
 		{
-			TbFieldRVA data = _rawImage.ReadFieldRVA(i + 1);
+			TbFieldRVA data = _rawImage->ReadFieldRVA(i + 1);
 			FieldDetail& fd = _fieldDetails[data.field - 1];
 			fd.defaultValueIndex = (uint32_t)_fieldDefaultValues.size();
 
@@ -372,7 +412,7 @@ namespace metadata
 			fdv.typeIndex = fd.fieldDef.typeIndex;
 
 			uint32_t dataImageOffset = (uint32_t)-1;
-			bool ret = _rawImage.TranslateRVAToImageOffset(data.rva, dataImageOffset);
+			bool ret = _rawImage->TranslateRVAToImageOffset(data.rva, dataImageOffset);
 			IL2CPP_ASSERT(ret);
 #if HYBRIDCLR_UNITY_2021_OR_NEW
 			fdv.dataIndex = (DefaultValueDataIndex)EncodeWithIndex(EncodeWithBlobSource(dataImageOffset, BlobSource::RAW_IMAGE));
@@ -385,7 +425,7 @@ namespace metadata
 
 	void InterpreterImage::InitBlittables()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 
 		std::vector<bool> computFlags(typeDefTb.rowNum, false);
 
@@ -482,7 +522,7 @@ namespace metadata
 
 		DefaultValueIndex retIndex = EncodeWithIndex(EncodeWithBlobSource((DefaultValueIndex)writer.Size(), BlobSource::CONVERTED_IL2CPP_FORMAT));
 
-		BlobReader reader = _rawImage.GetBlobReaderByRawIndex(blobIndex);
+		BlobReader reader = _rawImage->GetBlobReaderByRawIndex(blobIndex);
 		switch (type->type)
 		{
 		case IL2CPP_TYPE_BOOLEAN:
@@ -540,17 +580,17 @@ namespace metadata
 
 	void InterpreterImage::InitConsts()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::CONSTANT);
+		const Table& tb = _rawImage->GetTable(TableType::CONSTANT);
 		for (uint32_t i = 0; i < tb.rowNum; i++)
 		{
-			TbConstant data = _rawImage.ReadConstant(i + 1);
+			TbConstant data = _rawImage->ReadConstant(i + 1);
 			TableType parentType = DecodeHasConstantType(data.parent);
 			uint32_t rowIndex = DecodeHashConstantIndex(data.parent);
 
 			Il2CppType type = {};
 			type.type = (Il2CppTypeEnum)data.type;
 			TypeIndex dataTypeIndex = AddIl2CppTypeCache(type);
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 			bool isNullValue = type.type == IL2CPP_TYPE_CLASS;
 #endif
 			switch (parentType)
@@ -566,7 +606,7 @@ namespace metadata
 #if HYBRIDCLR_UNITY_2021_OR_NEW
 				fdv.dataIndex = ConvertConstValue(_constValues, data.value, &type);
 #else
-				uint32_t dataImageOffset = _rawImage.GetImageOffsetOfBlob(type.type, data.value);
+				uint32_t dataImageOffset = _rawImage->GetImageOffsetOfBlob(type.type, data.value);
 				fdv.dataIndex = isNullValue ? kDefaultValueIndexNull : (DefaultValueDataIndex)EncodeWithIndex(dataImageOffset);
 #endif
 				_fieldDefaultValues.push_back(fdv);
@@ -584,7 +624,7 @@ namespace metadata
 #if HYBRIDCLR_UNITY_2021_OR_NEW
 				pdv.dataIndex = ConvertConstValue(_constValues, data.value, &type);
 #else
-				uint32_t dataImageOffset = _rawImage.GetImageOffsetOfBlob(type.type, data.value);
+				uint32_t dataImageOffset = _rawImage->GetImageOffsetOfBlob(type.type, data.value);
 				pdv.dataIndex = isNullValue ? kDefaultValueIndexNull : (DefaultValueDataIndex)EncodeWithIndex(dataImageOffset);
 #endif
 				_paramDefaultValues.push_back(pdv);
@@ -606,7 +646,7 @@ namespace metadata
 
 	void InterpreterImage::InitCustomAttributes()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::CUSTOMATTRIBUTE);
+		const Table& tb = _rawImage->GetTable(TableType::CUSTOMATTRIBUTE);
 		_tokenCustomAttributes.reserve(tb.rowNum);
 
 
@@ -614,7 +654,7 @@ namespace metadata
 		Il2CppCustomAttributeTypeRange* curTypeRange = nullptr;
 		for (uint32_t rowIndex = 1; rowIndex <= tb.rowNum; rowIndex++)
 		{
-			TbCustomAttribute data = _rawImage.ReadCustomAttribute(rowIndex);
+			TbCustomAttribute data = _rawImage->ReadCustomAttribute(rowIndex);
 			TableType parentType = DecodeHasCustomAttributeCodedIndexTableType(data.parent);
 			uint32_t parentRowIndex = DecodeHasCustomAttributeCodedIndexRowIndex(data.parent);
 			uint32_t token = EncodeToken(parentType, parentRowIndex);
@@ -631,7 +671,7 @@ namespace metadata
 #endif
 				curTypeRange = &_customAttributeHandles[handleIndex];
 			}
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 			++curTypeRange->count;
 #endif
 			TableType ctorMethodTableType = DecodeCustomAttributeTypeCodedIndexTableType(data.type);
@@ -706,7 +746,7 @@ namespace metadata
 			methodIndexDataOffset += sizeof(int32_t);
 			if (ca.value != 0)
 			{
-				BlobReader reader = _rawImage.GetBlobReaderByRawIndex(ca.value);
+				BlobReader reader = _rawImage->GetBlobReaderByRawIndex(ca.value);
 				ConvertILCustomAttributeData2Il2CppFormat(ctorMethod, reader);
 			}
 			else
@@ -717,7 +757,7 @@ namespace metadata
 				_il2cppFormatCustomDataBlob.WriteCompressedUint32(0);
 			}
 		}
-		void* resultData = IL2CPP_MALLOC(_il2cppFormatCustomDataBlob.Size());
+		void* resultData = HYBRIDCLR_MALLOC(_il2cppFormatCustomDataBlob.Size());
 		std::memcpy(resultData, _il2cppFormatCustomDataBlob.Data(), _il2cppFormatCustomDataBlob.Size());
 		cai.dataStartPtr = resultData;
 		cai.dataEndPtr = (uint8_t*)resultData + _il2cppFormatCustomDataBlob.Size();
@@ -1025,7 +1065,20 @@ namespace metadata
 			}
 			typeIndex = il2cpp::vm::GlobalMetadata::GetIndexForTypeDefinition(klass);
 		}
+#if UNITY_ENGINE_TUANJIE
+		fieldIndex = -1;
+		for (int32_t i = 0; i < klass->property_count; i++)
+		{
+			if (klass->properties[i] == propertyInfo)
+			{
+				fieldIndex = i;
+				break;;
+			}
+		}
+		IL2CPP_ASSERT(fieldIndex != -1);
+#else
 		fieldIndex = (int32_t)(propertyInfo - klass->properties);
+#endif
 	}
 
 	void InterpreterImage::ConvertILCustomAttributeData2Il2CppFormat(const MethodInfo* ctorMethod, BlobReader& reader)
@@ -1099,7 +1152,7 @@ namespace metadata
 	}
 #endif
 
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 
 	void InterpreterImage::ConstructCustomAttribute(BlobReader& reader, Il2CppObject* obj, const MethodInfo* ctorMethod)
 	{
@@ -1226,7 +1279,7 @@ namespace metadata
 			Il2CppArray* paramArr = nullptr;
 			if (ca.value != 0)
 			{
-				BlobReader reader = _rawImage.GetBlobReaderByRawIndex(ca.value);
+				BlobReader reader = _rawImage->GetBlobReaderByRawIndex(ca.value);
 				ConstructCustomAttribute(reader, attr, ctorMethod);
 			}
 			else
@@ -1313,8 +1366,8 @@ namespace metadata
 
 	void InterpreterImage::InitMethodDefs0()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
-		const Table& methodTb = _rawImage.GetTable(TableType::METHOD);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
+		const Table& methodTb = _rawImage->GetTable(TableType::METHOD);
 
 		_methodDefines.resize(methodTb.rowNum);
 		for (Il2CppMethodDefinition& md : _methodDefines)
@@ -1325,8 +1378,8 @@ namespace metadata
 
 	void InterpreterImage::InitMethodDefs()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
-		const Table& methodTb = _rawImage.GetTable(TableType::METHOD);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
+		const Table& methodTb = _rawImage->GetTable(TableType::METHOD);
 
 		for (uint32_t i = 0, n = typeDefTb.rowNum; i < n; i++)
 		{
@@ -1342,14 +1395,13 @@ namespace metadata
 
 
 		_methodDefine2InfoCaches.resize(methodTb.rowNum);
-		_methodBodies.resize(methodTb.rowNum);
 
-		int32_t paramTableRowNum = _rawImage.GetTable(TableType::PARAM).rowNum;
+		int32_t paramTableRowNum = _rawImage->GetTable(TableType::PARAM).rowNum;
 		for (uint32_t index = 0; index < methodTb.rowNum; index++)
 		{
 			Il2CppMethodDefinition& md = _methodDefines[index];
 			uint32_t rowIndex = index + 1;
-			TbMethod methodData = _rawImage.ReadMethod(rowIndex);
+			TbMethod methodData = _rawImage->ReadMethod(rowIndex);
 
 			md.nameIndex = EncodeWithIndex(methodData.name);
 			md.parameterStart = methodData.paramList - 1;
@@ -1368,8 +1420,8 @@ namespace metadata
 				md.parameterCount = (int)paramTableRowNum - (int32_t)md.parameterStart;
 			}
 
-			MethodBody& body = _methodBodies[index];
-			ReadMethodBody(md, methodData, body);
+			//MethodBody& body = _methodBodies[index];
+			//ReadMethodBody(md, methodData, body);
 		}
 
 		for (uint32_t i = 0, n = typeDefTb.rowNum; i < n; i++)
@@ -1381,7 +1433,7 @@ namespace metadata
 			for (int m = 0; m < typeDef.method_count; m++)
 			{
 				Il2CppMethodDefinition& md = _methodDefines[rawMethodStart + m];
-				const char* methodName = _rawImage.GetStringFromRawIndex(DecodeMetadataIndex(md.nameIndex));
+				const char* methodName = _rawImage->GetStringFromRawIndex(DecodeMetadataIndex(md.nameIndex));
 				if (!std::strcmp(methodName, ".cctor"))
 				{
 					typeDef.bitfield |= (1 << (il2cpp::vm::kBitHasStaticConstructor - 1));
@@ -1395,9 +1447,9 @@ namespace metadata
 					md.slot = slotIdx++;
 				}
 				// TODO 可以考虑优化一下,将 signature在前一步存到暂时不用的 returnType里
-				TbMethod methodData = _rawImage.ReadMethod(rawMethodStart + m + 1);
+				TbMethod methodData = _rawImage->ReadMethod(rawMethodStart + m + 1);
 
-				BlobReader methodSigReader = _rawImage.GetBlobReaderByRawIndex(methodData.signature);
+				BlobReader methodSigReader = _rawImage->GetBlobReaderByRawIndex(methodData.signature);
 				uint32_t namedParamStart = md.parameterStart;
 				uint32_t namedParamCount = md.parameterCount;
 
@@ -1413,7 +1465,7 @@ namespace metadata
 				md.parameterCount = actualParamCount;
 				for (uint32_t paramRowIndex = namedParamStart + 1; paramRowIndex <= namedParamStart + namedParamCount; paramRowIndex++)
 				{
-					TbParam data = _rawImage.ReadParam(paramRowIndex);
+					TbParam data = _rawImage->ReadParam(paramRowIndex);
 					if (data.sequence > 0)
 					{
 						int32_t actualParamIndex = actualParamStart + data.sequence - 1;
@@ -1434,37 +1486,80 @@ namespace metadata
 						// data.sequence == 0  is for returnType.
 						// used for parent of CustomeAttributes of ReturnType
 						// il2cpp not support ReturnType CustomAttributes. so we just ignore it.
+#if SUPPORT_METHOD_RETURN_TYPE_CUSTOM_ATTRIBUTE
+						md.returnParameterToken = EncodeToken(TableType::PARAM, paramRowIndex);
+#endif
 					}
 				}
 			}
 		}
 	}
 
+	std::vector<MethodImpl> s_emptyMethodImpls;
+
+	const std::vector<MethodImpl>& InterpreterImage::GetTypeMethodImplByTypeDefinition(const Il2CppTypeDefinition* typeDef)
+	{
+		uint32_t index = (uint32_t)(typeDef - &_typesDefines[0]);
+		IL2CPP_ASSERT(index < (uint32_t)_typeDetails.size());
+		TypeDefinitionDetail& tdd = _typeDetails[index];
+		std::vector<MethodImpl>* methodImpls = tdd.methodImpls;
+		if (methodImpls == nullptr)
+		{
+			if (tdd.methodImplCount == 0)
+			{
+				methodImpls = &s_emptyMethodImpls;
+			}
+			else
+			{
+				methodImpls = new std::vector<MethodImpl>(tdd.methodImplCount);
+				for (uint32_t i = 0; i < tdd.methodImplCount; i++)
+				{
+					uint32_t index = tdd.methodImplStart + i;
+					TbMethodImpl data = _rawImage->ReadMethodImpl(index + 1);
+					TypeDefinitionDetail& tdd = _typeDetails[data.classIdx - 1];
+					Il2CppGenericContainer* gc = GetGenericContainerByTypeDefinition(tdd.typeDef);
+					MethodImpl& impl = (*methodImpls)[i];
+					ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodBody), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodBody), impl.body);
+					ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodDeclaration), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodDeclaration), impl.declaration);
+				}
+			}
+
+
+			tdd.methodImpls = methodImpls;
+		}
+		return *methodImpls;
+	}
+
 	void InterpreterImage::InitMethodImpls0()
 	{
-		const Table& miTb = _rawImage.GetTable(TableType::METHODIMPL);
+		const Table& miTb = _rawImage->GetTable(TableType::METHODIMPL);
 		for (uint32_t i = 0; i < miTb.rowNum; i++)
 		{
-			TbMethodImpl data = _rawImage.ReadMethodImpl(i + 1);
+			TbMethodImpl data = _rawImage->ReadMethodImpl(i + 1);
 			TypeDefinitionDetail& tdd = _typeDetails[data.classIdx - 1];
 			Il2CppGenericContainer* gc = GetGenericContainerByTypeDefinition(tdd.typeDef);
-			MethodImpl impl;
-			ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodBody), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodBody), impl.body);
-			ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodDeclaration), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodDeclaration), impl.declaration);
-			tdd.methodImpls.push_back(impl);
+			if (tdd.methodImplCount == 0)
+			{
+				tdd.methodImplStart = i;
+			}
+			++tdd.methodImplCount;
+			//MethodImpl impl;
+			//ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodBody), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodBody), impl.body);
+			//ReadMethodRefInfoFromToken(gc, nullptr, DecodeMethodDefOrRefCodedIndexTableType(data.methodDeclaration), DecodeMethodDefOrRefCodedIndexRowIndex(data.methodDeclaration), impl.declaration);
+			//tdd.methodImpls.push_back(impl);
 		}
 	}
 
 	void InterpreterImage::InitProperties()
 	{
-		const Table& propertyMapTb = _rawImage.GetTable(TableType::PROPERTYMAP);
-		const Table& propertyTb = _rawImage.GetTable(TableType::PROPERTY);
+		const Table& propertyMapTb = _rawImage->GetTable(TableType::PROPERTYMAP);
+		const Table& propertyTb = _rawImage->GetTable(TableType::PROPERTY);
 		_propeties.reserve(propertyTb.rowNum);
 
 		for (uint32_t rowIndex = 1; rowIndex <= propertyTb.rowNum; rowIndex++)
 		{
-			TbProperty data = _rawImage.ReadProperty(rowIndex);
-			_propeties.push_back({ _rawImage.GetStringFromRawIndex(data.name), data.flags, data.type, 0, 0
+			TbProperty data = _rawImage->ReadProperty(rowIndex);
+			_propeties.push_back({ _rawImage->GetStringFromRawIndex(data.name), data.flags, data.type, 0, 0
 				, nullptr
 				, { (StringIndex)EncodeWithIndex(data.name), kMethodIndexInvalid, kMethodIndexInvalid, (uint32_t)data.flags, EncodeToken(TableType::PROPERTY, rowIndex)}
 				});
@@ -1473,7 +1568,7 @@ namespace metadata
 		Il2CppTypeDefinition* last = nullptr;
 		for (uint32_t rowIndex = 1; rowIndex <= propertyMapTb.rowNum; rowIndex++)
 		{
-			TbPropertyMap data = _rawImage.ReadPropertyMap(rowIndex);
+			TbPropertyMap data = _rawImage->ReadPropertyMap(rowIndex);
 			TypeDefinitionDetail& cur = _typeDetails[data.parent - 1];
 			cur.typeDef->propertyStart = EncodeWithIndex(data.propertyList); // start from 1
 			if (last != nullptr)
@@ -1486,24 +1581,43 @@ namespace metadata
 		{
 			last->property_count = propertyTb.rowNum - DecodeMetadataIndex(last->propertyStart) + 1;
 		}
+#if HYBRIDCLR_UNITY_2019
+		for (const TypeDefinitionDetail& tdd : _typeDetails)
+		{
+			const Il2CppTypeDefinition* typeDef = tdd.typeDef;
+			if (typeDef->property_count == 0)
+			{
+				continue;
+	}
+			for (int32_t start = DecodeMetadataIndex(typeDef->propertyStart), i = 0; i < typeDef->property_count; i++)
+			{
+				_propeties[start + i - 1].declaringType = typeDef;
+			}
+		}
+#endif
 	}
 
 	void InterpreterImage::InitEvents()
 	{
-		const Table& eventMapTb = _rawImage.GetTable(TableType::EVENTMAP);
-		const Table& eventTb = _rawImage.GetTable(TableType::EVENT);
+		const Table& eventMapTb = _rawImage->GetTable(TableType::EVENTMAP);
+		const Table& eventTb = _rawImage->GetTable(TableType::EVENT);
 		_events.reserve(eventTb.rowNum);
 
 		for (uint32_t rowIndex = 1; rowIndex <= eventTb.rowNum; rowIndex++)
 		{
-			TbEvent data = _rawImage.ReadEvent(rowIndex);
-			_events.push_back({ _rawImage.GetStringFromRawIndex(data.name), data.eventFlags, data.eventType, 0, 0, 0});
+			TbEvent data = _rawImage->ReadEvent(rowIndex);
+			_events.push_back({ _rawImage->GetStringFromRawIndex(data.name), data.eventFlags, data.eventType, 0, 0, 0
+#if HYBRIDCLR_UNITY_2019
+				, nullptr
+				, { (StringIndex)EncodeWithIndex(data.name), kTypeIndexInvalid, kMethodIndexInvalid, kMethodIndexInvalid, kMethodIndexInvalid, EncodeToken(TableType::EVENT, rowIndex)}
+#endif
+				});
 		}
 
 		Il2CppTypeDefinition* last = nullptr;
 		for (uint32_t rowIndex = 1; rowIndex <= eventMapTb.rowNum; rowIndex++)
 		{
-			TbEventMap data = _rawImage.ReadEventMap(rowIndex);
+			TbEventMap data = _rawImage->ReadEventMap(rowIndex);
 			TypeDefinitionDetail& cur = _typeDetails[data.parent - 1];
 			cur.typeDef->eventStart = EncodeWithIndex(data.eventList); // start from 1
 			if (last != nullptr)
@@ -1516,15 +1630,31 @@ namespace metadata
 		{
 			last->event_count = eventTb.rowNum - DecodeMetadataIndex(last->eventStart) + 1;
 		}
+#if HYBRIDCLR_UNITY_2019
+		for (const TypeDefinitionDetail& tdd : _typeDetails)
+		{
+			const Il2CppTypeDefinition* typeDef = tdd.typeDef;
+			if (typeDef->event_count == 0)
+			{
+				continue;
+	}
+			for (int32_t start = DecodeMetadataIndex(typeDef->eventStart), i = 0; i < typeDef->event_count; i++)
+			{
+				EventDetail& ed = _events[start + i - 1];
+				ed.declaringType = typeDef;
+				ed.il2cppDefinition.typeIndex = typeDef->byvalTypeIndex;
+			}
+		}
+#endif
 	}
 
 
 	void InterpreterImage::InitMethodSemantics()
 	{
-		const Table& msTb = _rawImage.GetTable(TableType::METHODSEMANTICS);
+		const Table& msTb = _rawImage->GetTable(TableType::METHODSEMANTICS);
 		for (uint32_t rowIndex = 1; rowIndex <= msTb.rowNum; rowIndex++)
 		{
-			TbMethodSemantics data = _rawImage.ReadMethodSemantics(rowIndex);
+			TbMethodSemantics data = _rawImage->ReadMethodSemantics(rowIndex);
 			uint32_t method = data.method;
 			uint16_t semantics = data.semantics;
 			TableType tableType = DecodeHasSemanticsCodedIndexTableType(data.association);
@@ -1534,30 +1664,45 @@ namespace metadata
 				IL2CPP_ASSERT(tableType == TableType::PROPERTY);
 				PropertyDetail& pd = _propeties[propertyOrEventIndex];
 				pd.getterMethodIndex = method;
+#if HYBRIDCLR_UNITY_2019
+				pd.il2cppDefinition.get = method - DecodeMetadataIndex(pd.declaringType->methodStart) - 1;
+#endif
 			}
 			if (semantics & (uint16_t)MethodSemanticsAttributes::Setter)
 			{
 				IL2CPP_ASSERT(tableType == TableType::PROPERTY);
 				PropertyDetail& pd = _propeties[propertyOrEventIndex];
 				pd.setterMethodIndex = method;
+#if HYBRIDCLR_UNITY_2019
+				pd.il2cppDefinition.set = method - DecodeMetadataIndex(pd.declaringType->methodStart) - 1;
+#endif
 			}
 			if (semantics & (uint16_t)MethodSemanticsAttributes::AddOn)
 			{
 				IL2CPP_ASSERT(tableType == TableType::EVENT);
 				EventDetail& ed = _events[propertyOrEventIndex];
 				ed.addMethodIndex = method;
+#if HYBRIDCLR_UNITY_2019
+				ed.il2cppDefinition.add = method - DecodeMetadataIndex(ed.declaringType->methodStart) - 1;
+#endif
 			}
 			if (semantics & (uint16_t)MethodSemanticsAttributes::RemoveOn)
 			{
 				IL2CPP_ASSERT(tableType == TableType::EVENT);
 				EventDetail& ed = _events[propertyOrEventIndex];
 				ed.removeMethodIndex = method;
+#if HYBRIDCLR_UNITY_2019
+				ed.il2cppDefinition.remove = method - DecodeMetadataIndex(ed.declaringType->methodStart) - 1;
+#endif
 			}
 			if (semantics & (uint16_t)MethodSemanticsAttributes::Fire)
 			{
 				IL2CPP_ASSERT(tableType == TableType::EVENT);
 				EventDetail& ed = _events[propertyOrEventIndex];
 				ed.fireMethodIndex = method;
+#if HYBRIDCLR_UNITY_2019
+				ed.il2cppDefinition.raise = method - DecodeMetadataIndex(ed.declaringType->methodStart) - 1;
+#endif
 			}
 		}
 	}
@@ -1570,13 +1715,13 @@ namespace metadata
 
 	void InterpreterImage::InitNestedClass()
 	{
-		const Table& nestedClassTb = _rawImage.GetTable(TableType::NESTEDCLASS);
+		const Table& nestedClassTb = _rawImage->GetTable(TableType::NESTEDCLASS);
 		_nestedTypeDefineIndexs.reserve(nestedClassTb.rowNum);
 		std::vector<EnclosingClassInfo> enclosingTypes;
 
 		for (uint32_t i = 0; i < nestedClassTb.rowNum; i++)
 		{
-			TbNestedClass data = _rawImage.ReadNestedClass(i + 1);
+			TbNestedClass data = _rawImage->ReadNestedClass(i + 1);
 			Il2CppTypeDefinition& nestedType = _typesDefines[data.nestedClass - 1];
 			Il2CppTypeDefinition& enclosingType = _typesDefines[data.enclosingClass - 1];
 			if (enclosingType.nested_type_count == 0)
@@ -1603,10 +1748,10 @@ namespace metadata
 
 	void InterpreterImage::InitClassLayouts()
 	{
-		const Table& classLayoutTb = _rawImage.GetTable(TableType::CLASSLAYOUT);
+		const Table& classLayoutTb = _rawImage->GetTable(TableType::CLASSLAYOUT);
 		for (uint32_t i = 0; i < classLayoutTb.rowNum; i++)
 		{
-			TbClassLayout data = _rawImage.ReadClassLayout(i + 1);
+			TbClassLayout data = _rawImage->ReadClassLayout(i + 1);
 			_classLayouts[data.parent - 1] = data;
 			if (data.classSize > 0)
 			{
@@ -1669,14 +1814,16 @@ namespace metadata
 
 	uint32_t InterpreterImage::AddIl2CppTypeCache(const Il2CppType& type)
 	{
-		auto it = _type2Indexs.find(type);
+		auto it = _type2Indexs.find(&type);
 		if (it != _type2Indexs.end())
 		{
 			return it->second;
 		}
 		uint32_t encodeIndex = EncodeWithIndex((uint32_t)_types.size());
-		_types.push_back(type);
-		_type2Indexs.insert({ type, encodeIndex });
+		Il2CppType* newType = (Il2CppType*)HYBRIDCLR_METADATA_MALLOC(sizeof(Il2CppType));
+		*newType = type;
+		_types.push_back(newType);
+		_type2Indexs.insert({ newType, encodeIndex });
 		return encodeIndex;
 	}
 
@@ -1689,7 +1836,7 @@ namespace metadata
 
 	void InterpreterImage::InitClass()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 		_classList.resize(typeDefTb.rowNum);
 	}
 
@@ -1714,10 +1861,28 @@ namespace metadata
 		return klass;
 	}
 
-	const Il2CppType* InterpreterImage::GetInterfaceFromIndex(const Il2CppClass* klass, TypeInterfaceIndex globalOffset)
+	const Il2CppType* InterpreterImage::GetInterfaceFromGlobalOffset(TypeInterfaceIndex globalOffset)
 	{
 		IL2CPP_ASSERT((uint32_t)globalOffset < (uint32_t)_interfaceDefines.size());
-		return &_types[_interfaceDefines[globalOffset]];
+
+		TypeIndex typeIndex = _interfaceDefines[globalOffset];
+		if (typeIndex == kTypeIndexInvalid)
+		{
+			uint32_t rowIndex = globalOffset + 1;
+			TbInterfaceImpl data = _rawImage->ReadInterfaceImpl(rowIndex);
+			Il2CppTypeDefinition& typeDef = _typesDefines[data.classIdx - 1];
+			Il2CppType intType = {};
+			ReadTypeFromToken(GetGenericContainerByTypeDefinition(&typeDef), nullptr,
+				DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.interfaceIdx), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.interfaceIdx), intType);
+			_interfaceDefines[globalOffset] = typeIndex = DecodeMetadataIndex(AddIl2CppTypeCache(intType));
+		}
+
+		return _types[typeIndex];
+	}
+
+	const Il2CppType* InterpreterImage::GetInterfaceFromIndex(const Il2CppClass* klass, TypeInterfaceIndex globalOffset)
+	{
+		return GetInterfaceFromGlobalOffset(globalOffset);
 	}
 
 	const Il2CppType* InterpreterImage::GetInterfaceFromOffset(const Il2CppClass* klass, TypeInterfaceIndex offset)
@@ -1730,8 +1895,7 @@ namespace metadata
 	const Il2CppType* InterpreterImage::GetInterfaceFromOffset(const Il2CppTypeDefinition* typeDef, TypeInterfaceIndex offset)
 	{
 		uint32_t globalOffset = typeDef->interfacesStart + offset;
-		IL2CPP_ASSERT(globalOffset < (uint32_t)_interfaceDefines.size());
-		return &_types[_interfaceDefines[globalOffset]];
+		return GetInterfaceFromGlobalOffset(globalOffset);
 	}
 
 	Il2CppInterfaceOffsetInfo InterpreterImage::GetInterfaceOffsetInfo(const Il2CppTypeDefinition* typeDefine, TypeInterfaceOffsetIndex index)
@@ -1789,11 +1953,11 @@ namespace metadata
 
 	const Il2CppAssembly* InterpreterImage::GetReferencedAssembly(int32_t referencedAssemblyTableIndex, const Il2CppAssembly assembliesTable[], int assembliesCount)
 	{
-		auto& table = _rawImage.GetTable(TableType::ASSEMBLYREF);
+		auto& table = _rawImage->GetTable(TableType::ASSEMBLYREF);
 		IL2CPP_ASSERT((uint32_t)referencedAssemblyTableIndex < table.rowNum);
 
-		TbAssemblyRef assRef = _rawImage.ReadAssemblyRef(referencedAssemblyTableIndex + 1);
-		const char* refAssName = _rawImage.GetStringFromRawIndex(assRef.name);
+		TbAssemblyRef assRef = _rawImage->ReadAssemblyRef(referencedAssemblyTableIndex + 1);
+		const char* refAssName = _rawImage->GetStringFromRawIndex(assRef.name);
 		const Il2CppAssembly* il2cppAssRef = il2cpp::vm::Assembly::GetLoadedAssembly(refAssName);
 		if (!il2cppAssRef)
 		{
@@ -1829,12 +1993,12 @@ namespace metadata
 
 	void InterpreterImage::InitGenericParamConstraintDefs()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::GENERICPARAMCONSTRAINT);
-		_genericConstraints.resize(tb.rowNum);
+		const Table& tb = _rawImage->GetTable(TableType::GENERICPARAMCONSTRAINT);
+		_genericConstraints.resize(tb.rowNum, kTypeIndexInvalid);
 		for (uint32_t i = 0; i < tb.rowNum; i++)
 		{
 			uint32_t rowIndex = i + 1;
-			TbGenericParamConstraint data = _rawImage.ReadGenericParamConstraint(rowIndex);
+			TbGenericParamConstraint data = _rawImage->ReadGenericParamConstraint(rowIndex);
 			Il2CppGenericParameter& genericParam = _genericParams[data.owner - 1];
 
 			if (genericParam.constraintsCount == 0)
@@ -1842,31 +2006,32 @@ namespace metadata
 				genericParam.constraintsStart = EncodeWithIndex(i);
 			}
 			++genericParam.constraintsCount;
+			//_genericConstraints[i] == kTypeIndexInvalid;
 
-			Il2CppType paramCons = {};
+			//Il2CppType paramCons = {};
 
-			const Il2CppGenericContainer* klassGc;
-			const Il2CppGenericContainer* methodGc;
-			GetClassAndMethodGenericContainerFromGenericContainerIndex(genericParam.ownerIndex, klassGc, methodGc);
+			//const Il2CppGenericContainer* klassGc;
+			//const Il2CppGenericContainer* methodGc;
+			//GetClassAndMethodGenericContainerFromGenericContainerIndex(genericParam.ownerIndex, klassGc, methodGc);
 
-			ReadTypeFromToken(klassGc, methodGc, DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.constraint), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.constraint), paramCons);
-			_genericConstraints[i] = DecodeMetadataIndex(AddIl2CppTypeCache(paramCons));
+			//ReadTypeFromToken(klassGc, methodGc, DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.constraint), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.constraint), paramCons);
+			//_genericConstraints[i] = DecodeMetadataIndex(AddIl2CppTypeCache(paramCons));
 		}
 	}
 
 	void InterpreterImage::InitGenericParamDefs0()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::GENERICPARAM);
+		const Table& tb = _rawImage->GetTable(TableType::GENERICPARAM);
 		_genericParams.resize(tb.rowNum);
 	}
 
 	void InterpreterImage::InitGenericParamDefs()
 	{
-		const Table& tb = _rawImage.GetTable(TableType::GENERICPARAM);
+		const Table& tb = _rawImage->GetTable(TableType::GENERICPARAM);
 		for (uint32_t i = 0; i < tb.rowNum; i++)
 		{
 			uint32_t rowIndex = i + 1;
-			TbGenericParam data = _rawImage.ReadGenericParam(rowIndex);
+			TbGenericParam data = _rawImage->ReadGenericParam(rowIndex);
 			Il2CppGenericParameter& paramDef = _genericParams[i];
 			paramDef.num = data.number;
 			paramDef.flags = data.flags;
@@ -1915,24 +2080,24 @@ namespace metadata
 
 	void InterpreterImage::InitInterfaces()
 	{
-		const Table& table = _rawImage.GetTable(TableType::INTERFACEIMPL);
+		const Table& table = _rawImage->GetTable(TableType::INTERFACEIMPL);
 
 		// interface中只包含直接继承的interface,不包括来自父类的
 		// 此interface只在CastClass及Type.GetInterfaces()反射函数中
 		// 发挥作用，不在callvir中发挥作用。
 		// interfaceOffsets中包含了水平展开的所有interface(包括父类的)
-		_interfaceDefines.resize(table.rowNum);
+		_interfaceDefines.resize(table.rowNum, kTypeIndexInvalid);
 		uint32_t lastClassIdx = 0;
 		for (uint32_t i = 0; i < table.rowNum; i++)
 		{
 			uint32_t rowIndex = i + 1;
-			TbInterfaceImpl data = _rawImage.ReadInterfaceImpl(rowIndex);
+			TbInterfaceImpl data = _rawImage->ReadInterfaceImpl(rowIndex);
 
 			Il2CppTypeDefinition& typeDef = _typesDefines[data.classIdx - 1];
-			Il2CppType intType = {};
-			ReadTypeFromToken(GetGenericContainerByTypeDefinition(&typeDef), nullptr,
-				DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.interfaceIdx), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.interfaceIdx), intType);
-			_interfaceDefines[i] = DecodeMetadataIndex(AddIl2CppTypeCache(intType));
+			//Il2CppType intType = {};
+			//ReadTypeFromToken(GetGenericContainerByTypeDefinition(&typeDef), nullptr,
+			//	DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.interfaceIdx), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.interfaceIdx), intType);
+			//_interfaceDefines[i] = DecodeMetadataIndex(AddIl2CppTypeCache(intType));
 			if (typeDef.interfaces_count == 0)
 			{
 				typeDef.interfacesStart = (InterfacesIndex)i;
@@ -1993,7 +2158,7 @@ namespace metadata
 
 	void InterpreterImage::InitVTables()
 	{
-		const Table& typeDefTb = _rawImage.GetTable(TableType::TYPEDEF);
+		const Table& typeDefTb = _rawImage->GetTable(TableType::TYPEDEF);
 
 		for (TypeDefinitionDetail& td : _typeDetails)
 		{
@@ -2003,7 +2168,7 @@ namespace metadata
 		for (auto& e : _cacheTrees)
 		{
 			e.second->~VTableSetUp();
-			IL2CPP_FREE(e.second);
+			HYBRIDCLR_FREE(e.second);
 		}
 		Il2CppType2TypeDeclaringTreeMap temp;
 		_cacheTrees.swap(temp);
@@ -2126,7 +2291,7 @@ namespace metadata
 		else
 		{
 			uint32_t len = reader.ReadCompressedUint32();
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 			return il2cpp::vm::String::NewLen((char*)reader.GetAndSkipCurBytes(len), len);
 #else
 			char* chars = (char*)reader.GetDataOfReadPosition();
@@ -2353,7 +2518,7 @@ namespace metadata
 		case IL2CPP_TYPE_SZARRAY:
 		{
 			// FIXME MEMORY LEAK
-			Il2CppType* eleType = (Il2CppType*)IL2CPP_MALLOC_ZERO(sizeof(Il2CppType));
+			Il2CppType* eleType = (Il2CppType*)HYBRIDCLR_MALLOC_ZERO(sizeof(Il2CppType));
 			ReadCustomAttributeFieldOrPropType(reader, *eleType);
 			type.data.type = eleType;
 			break;
@@ -2440,8 +2605,8 @@ namespace metadata
 		{
 			return false;
 		}
-		const char* typeNameStr = _rawImage.GetStringFromRawIndex(typeName);
-		const char* typeNamespaceStr = _rawImage.GetStringFromRawIndex(typeNamespace);
+		const char* typeNameStr = _rawImage->GetStringFromRawIndex(typeName);
+		const char* typeNamespaceStr = _rawImage->GetStringFromRawIndex(typeNamespace);
 		il2cpp::vm::Exception::Raise(il2cpp::vm::Exception::GetTypeLoadException(
 			CStringToStringView(typeNamespaceStr),
 			CStringToStringView(typeNameStr),

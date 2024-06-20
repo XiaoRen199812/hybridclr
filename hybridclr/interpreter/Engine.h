@@ -9,25 +9,34 @@
 #include "vm/StackTrace.h"
 
 #include "../metadata/MetadataUtil.h"
-#include "../Config.h"
+#include "../RuntimeConfig.h"
 
 #include "InterpreterDefs.h"
 #include "MemoryUtil.h"
 #include "MethodBridge.h"
+#include <algorithm>
 
 
-//#if DEBUG
-//#define PUSH_STACK_FRAME(method) do { \
-//	Il2CppStackFrameInfo stackFrameInfo = { method, (uintptr_t)method->methodPointer }; \
-//	il2cpp::vm::StackTrace::PushFrame(stackFrameInfo); \
-//} while(0)
-//
-//#define POP_STACK_FRAME() do { il2cpp::vm::StackTrace::PopFrame(); } while(0)
-//
-//#else 
+#if IL2CPP_ENABLE_STACKTRACE_SENTRIES
+
+#if HYBRIDCLR_UNITY_2020_OR_NEW
+#define PUSH_STACK_FRAME(method) do { \
+	Il2CppStackFrameInfo stackFrameInfo = { method, (uintptr_t)method->methodPointer }; \
+	il2cpp::vm::StackTrace::PushFrame(stackFrameInfo); \
+} while(0)
+#else
+#define PUSH_STACK_FRAME(method) do { \
+	Il2CppStackFrameInfo stackFrameInfo = { method }; \
+	il2cpp::vm::StackTrace::PushFrame(stackFrameInfo); \
+} while(0)
+#endif
+
+#define POP_STACK_FRAME() do { il2cpp::vm::StackTrace::PopFrame(); } while(0)
+
+#else 
 #define PUSH_STACK_FRAME(method)
 #define POP_STACK_FRAME() 
-//#endif
+#endif
 
 namespace hybridclr
 {
@@ -39,7 +48,6 @@ namespace interpreter
 	public:
 		MachineState()
 		{
-			Config& hc = Config::GetIns();
 			_stackSize = -1;
 			_stackBase = nullptr;
 			_stackTopIdx = 0;
@@ -60,15 +68,15 @@ namespace interpreter
 			{
 				//il2cpp::gc::GarbageCollector::FreeFixed(_stackBase);
 				il2cpp::gc::GarbageCollector::UnregisterDynamicRoot(this);
-				IL2CPP_FREE(_stackBase);
+				HYBRIDCLR_FREE(_stackBase);
 			}
 			if (_frameBase)
 			{
-				IL2CPP_FREE(_frameBase);
+				HYBRIDCLR_FREE(_frameBase);
 			}
 			if (_exceptionFlowBase)
 			{
-				IL2CPP_FREE(_exceptionFlowBase);
+				HYBRIDCLR_FREE(_exceptionFlowBase);
 			}
 		}
 
@@ -259,17 +267,21 @@ namespace interpreter
 
 		void CollectFrames(il2cpp::vm::StackFrames* stackFrames)
 		{
+			if (_frameTopIdx <= 0)
+			{
+				return;
+			}
+			stackFrames->insert(stackFrames->begin(), _frameTopIdx, Il2CppStackFrameInfo());
 			for (int32_t i = 0; i < _frameTopIdx; i++)
 			{
 				InterpFrame* frame = _frameBase + i;
 				const MethodInfo* method = frame->method->method;
-				Il2CppStackFrameInfo stackFrameInfo = {
+				(*stackFrames)[i] = {
 					method
 #if HYBRIDCLR_UNITY_2020_OR_NEW
 					, (uintptr_t)method->methodPointer
 #endif
 				};
-				stackFrames->push_back(stackFrameInfo);
 			}
 		}
 
@@ -278,9 +290,8 @@ namespace interpreter
 
 		void InitEvalStack()
 		{
-			Config& hc = Config::GetIns();
-			_stackSize = (int32_t)hc.GetInterpreterThreadObjectStackSize();
-			_stackBase = (StackObject*)IL2CPP_MALLOC_ZERO(hc.GetInterpreterThreadObjectStackSize() * sizeof(StackObject));
+			_stackSize = (int32_t)RuntimeConfig::GetInterpreterThreadObjectStackSize();
+			_stackBase = (StackObject*)HYBRIDCLR_MALLOC_ZERO(RuntimeConfig::GetInterpreterThreadObjectStackSize() * sizeof(StackObject));
 			_stackTopIdx = 0;
 			_localPoolBottomIdx = _stackSize;
 			il2cpp::gc::GarbageCollector::RegisterDynamicRoot(this, GetGCRootData);
@@ -288,17 +299,15 @@ namespace interpreter
 
 		void InitFrames()
 		{
-			Config& hc = Config::GetIns();
-			_frameBase = (InterpFrame*)IL2CPP_CALLOC(hc.GetInterpreterThreadFrameStackSize(), sizeof(InterpFrame));
-			_frameCount = (int32_t)hc.GetInterpreterThreadFrameStackSize();
+			_frameBase = (InterpFrame*)HYBRIDCLR_CALLOC(RuntimeConfig::GetInterpreterThreadFrameStackSize(), sizeof(InterpFrame));
+			_frameCount = (int32_t)RuntimeConfig::GetInterpreterThreadFrameStackSize();
 			_frameTopIdx = 0;
 		}
 
 		void InitExceptionFlows()
 		{
-			Config& hc = Config::GetIns();
-			_exceptionFlowBase = (ExceptionFlowInfo*)IL2CPP_CALLOC(hc.GetInterpreterThreadExceptionFlowSize(), sizeof(ExceptionFlowInfo));
-			_exceptionFlowCount = (int32_t)hc.GetInterpreterThreadExceptionFlowSize();
+			_exceptionFlowBase = (ExceptionFlowInfo*)HYBRIDCLR_CALLOC(RuntimeConfig::GetInterpreterThreadExceptionFlowSize(), sizeof(ExceptionFlowInfo));
+			_exceptionFlowCount = (int32_t)RuntimeConfig::GetInterpreterThreadExceptionFlowSize();
 			_exceptionFlowTopIdx = 0;
 		}
 
@@ -384,28 +393,6 @@ namespace interpreter
 		MachineState& _machineState;
 		int32_t _stackBaseIdx;
 		uint32_t _frameBaseIdx;
-	};
-
-	class StackObjectAllocScope
-	{
-	private:
-		MachineState& _state;
-		const int32_t _originStackTop;
-		const int32_t _count;
-		StackObject* _data;
-	public:
-		StackObjectAllocScope(MachineState& state, int32_t count) : _state(state), _count(count), _originStackTop(_state.GetStackTop())
-		{
-			_data = state.AllocStackSlot(count);
-		}
-
-		~StackObjectAllocScope()
-		{
-			IL2CPP_ASSERT(_state.GetStackTop() > _originStackTop);
-			_state.SetStackTop(_originStackTop);
-		}
-
-		StackObject* GetData() const { return _data; }
 	};
 }
 }

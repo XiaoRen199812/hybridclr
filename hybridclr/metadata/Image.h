@@ -5,6 +5,7 @@
 #include <tuple>
 
 #include "vm/GlobalMetadataFileInternals.h"
+#include "vm/Assembly.h"
 #include "gc/GarbageCollector.h"
 #include "gc/Allocator.h"
 #include "gc/AppendOnlyGCHashMap.h"
@@ -41,7 +42,7 @@ namespace metadata
 
 		const RawImage& GetRawImage() const
 		{
-			return _rawImage;
+			return *_rawImage;
 		}
 
 		// misc
@@ -67,8 +68,8 @@ namespace metadata
 		// signature
 		void ReadMemberRefSig(const Il2CppGenericContainer* klassGenericContainer, TbMemberRef& data, ResolveMemberRefSig& signature);
 		void ReadFieldRefSig(BlobReader& reader, const Il2CppGenericContainer* klassGenericContainer, FieldRefSig& field);
-		void ReadMethodRefSig(TbMemberRef& rowData, MethodRefSig& method);
-		void ReadMethodSpecInstantiation(uint32_t signatureIdx, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, Il2CppGenericInst*& genericInstantiation);
+		void ReadMethodRefSig(BlobReader& reader, MethodRefSig& method);
+		void ReadMethodSpecInstantiation(uint32_t signatureIdx, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericInst*& genericInstantiation);
 		void ReadLocalVarSig(BlobReader& reader, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, Il2CppType*& vars, uint32_t& varCount);
 		void ReadStandAloneSig(uint32_t signatureIdx, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, ResolveStandAloneMethodSig& sig);
 
@@ -90,7 +91,7 @@ namespace metadata
 		const MethodInfo* FindImplMethod(Il2CppClass* klass, const MethodInfo* matchMethod);
 		const FieldInfo* GetFieldInfoFromToken(uint32_t token, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericContext* genericContext);
 		const MethodInfo* ReadMethodInfoFromToken(const Il2CppGenericContainer* klassGenericContainer,
-			const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericContext* genericContext, Il2CppGenericInst* genericInst, TableType tableType, uint32_t rowIndex);
+			const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericContext* genericContext, const Il2CppGenericInst* genericInst, TableType tableType, uint32_t rowIndex);
 		const MethodInfo* GetMethodInfoFromToken(uint32_t token, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericContext* genericContext);
 		const MethodInfo* GetMethodInfo(const Il2CppType* containerType, const Il2CppMethodDefinition* methodDef, const Il2CppGenericInst* instantiation, const Il2CppGenericContext* genericContext);
 		void GetStandAloneMethodSigFromToken(uint32_t token, const Il2CppGenericContainer* klassGenericContainer, const Il2CppGenericContainer* methodGenericContainer, const Il2CppGenericContext* genericContext, ResolveStandAloneMethodSig& methodSig);
@@ -102,7 +103,7 @@ namespace metadata
 		virtual Il2CppGenericContainer* GetGenericContainerByTypeDefRawIndex(int32_t typeDefIndex) = 0;
 		virtual const Il2CppMethodDefinition* GetMethodDefinitionFromRawIndex(uint32_t index) = 0;
 
-		virtual MethodBody* GetMethodBody(uint32_t token) = 0;
+		virtual MethodBody* GetMethodBody(uint32_t token, MethodBody& tempMethodBody) = 0;
 		virtual void ReadFieldRefInfoFromFieldDefToken(uint32_t rowIndex, FieldRefInfo& ret) = 0;
 		virtual void InitRuntimeMetadatas() = 0;
 	protected:
@@ -114,21 +115,43 @@ namespace metadata
 			{
 				_nameToAssemblies[ass->image->nameNoExt] = ass;
 			}
+			_rawImage = new RawImage();
 		}
 
-		const Il2CppAssembly* GetLoadedAssembly(const char* assemblyName) const
+		virtual ~Image()
+		{
+			if (_rawImage)
+			{
+				delete _rawImage;
+			}
+		}
+
+		const Il2CppAssembly* GetLoadedAssembly(const char* assemblyName)
 		{
 			auto it = _nameToAssemblies.find(assemblyName);
-			return it != _nameToAssemblies.end() ? it->second : nullptr;
+			if (it != _nameToAssemblies.end())
+			{
+				return it->second;
+			}
+			// relying assembly is loaded after self
+			for (const Il2CppAssembly* ass : *il2cpp::vm::Assembly::GetAllAssemblies())
+			{
+				if (!std::strcmp(ass->image->nameNoExt, assemblyName))
+				{
+					_nameToAssemblies[ass->image->nameNoExt] = ass;
+					return ass;
+				}
+			}
+			return nullptr;
 		}
 
 		Il2CppClass* FindNetStandardExportedType(const char* namespaceStr, const char* nameStr);
 
-		RawImage _rawImage;
+		RawImage* _rawImage;
 		Il2CppHashMap<const char*, const Il2CppAssembly*, CStringHash, CStringEqualTo> _nameToAssemblies;
-		il2cpp::gc::AppendOnlyGCHashMap<uint32_t, Il2CppString*, std::hash<uint32_t>> _il2cppStringCache;
+		il2cpp::gc::AppendOnlyGCHashMap<uint32_t, Il2CppString*, il2cpp::utils::PassThroughHash<uint32_t>> _il2cppStringCache;
 
-		std::unordered_map<std::tuple<uint32_t, const Il2CppGenericContext*>, void*, TokenGenericContextTypeHash, TokenGenericContextTypeEqual> _token2ResolvedDataCache;
+		Il2CppHashMap<std::tuple<uint32_t, const Il2CppGenericContext*>, void*, TokenGenericContextTypeHash, TokenGenericContextTypeEqual> _token2ResolvedDataCache;
 	};
 }
 }

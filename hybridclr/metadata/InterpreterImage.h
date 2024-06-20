@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #if HYBRIDCLR_UNITY_2021_OR_NEW
 #include "metadata/CustomAttributeDataReader.h"
 #include "CustomAttributeDataWriter.h"
@@ -25,7 +27,9 @@ namespace metadata
 		Il2CppTypeDefinition* typeDef;
 		Il2CppTypeDefinitionSizes typeSizes;
 		std::vector<VirtualMethodImpl> vtable;
-		std::vector<MethodImpl> methodImpls;
+		uint32_t methodImplStart;
+		uint32_t methodImplCount;
+		std::vector<MethodImpl>* methodImpls;
 	};
 
 	struct ParamDetail
@@ -53,7 +57,7 @@ namespace metadata
 		uint32_t signatureBlobIndex;
 		uint32_t getterMethodIndex; // start from 1;
 		uint32_t setterMethodIndex;
-		Il2CppTypeDefinition* declaringType;
+		const Il2CppTypeDefinition* declaringType;
 		Il2CppPropertyDefinition il2cppDefinition;
 	};
 
@@ -65,6 +69,10 @@ namespace metadata
 		uint32_t addMethodIndex; // start from 1
 		uint32_t removeMethodIndex; // start from 1
 		uint32_t fireMethodIndex; // start from 1;
+#if HYBRIDCLR_UNITY_2019
+		const Il2CppTypeDefinition* declaringType;
+		Il2CppEventDefinition il2cppDefinition;
+#endif
 	};
 
 	struct CustomAttribute
@@ -96,21 +104,20 @@ namespace metadata
 
 		static void Initialize();
 
-		static uint32_t AllocImageIndex();
+		static uint32_t AllocImageIndex(uint32_t dllLength);
 
 		static void RegisterImage(InterpreterImage* image);
 
 		static InterpreterImage* GetImage(uint32_t imageIndex)
 		{
 			//os::FastAutoLock lock(&s_imageLock);
-			IL2CPP_ASSERT(imageIndex <= kMaxLoadImageCount);
+			IL2CPP_ASSERT(imageIndex < kMaxMetadataImageCount);
 			return s_images[imageIndex];
 		}
 
 	private:
 
-		static uint32_t s_cliImageCount;
-		static InterpreterImage* s_images[kMaxLoadImageCount + 1];
+		static InterpreterImage* s_images[kMaxMetadataImageCount];
 
 	public:
 
@@ -129,7 +136,7 @@ namespace metadata
 				RaiseExecutionEngineException("image can't be init again");
 			}
 			_inited = true;
-			return _rawImage.Load(imageData, length);
+			return _rawImage->Load(imageData, length);
 		}
 
 		bool IsInitialized() const
@@ -157,12 +164,34 @@ namespace metadata
 			return rawIndex != 0 ? EncodeImageAndMetadataIndex(_index, rawIndex) : 0;
 		}
 
-		MethodBody* GetMethodBody(uint32_t token) override
+		MethodBody* GetMethodBody(uint32_t token, MethodBody& tempMethodBody) override
 		{
 			IL2CPP_ASSERT(DecodeTokenTableType(token) == TableType::METHOD);
 			uint32_t rowIndex = DecodeTokenRowIndex(token);
-			IL2CPP_ASSERT(rowIndex > 0 && rowIndex <= (uint32_t)_methodBodies.size());
-			return &_methodBodies[rowIndex - 1];
+			IL2CPP_ASSERT(rowIndex > 0 && rowIndex <= (uint32_t)_methodDefines.size());
+
+			auto it = _methodBodyCache.find(rowIndex);
+			if (it != _methodBodyCache.end())
+			{
+				return it->second;
+			}
+			const Il2CppMethodDefinition* methodDef = &_methodDefines[rowIndex - 1];
+			bool isGenericMethod = methodDef->genericContainerIndex != kGenericContainerIndexInvalid || _typesDefines[DecodeMetadataIndex(methodDef->declaringType)].genericContainerIndex != kGenericContainerIndexInvalid;
+
+			TbMethod methodData = _rawImage->ReadMethod(rowIndex);
+			MethodBody* resultMethodBody = nullptr;
+			// only cache generic method
+			if (isGenericMethod)
+			{
+				resultMethodBody = new (HYBRIDCLR_MALLOC_ZERO(sizeof(MethodBody))) MethodBody();
+				_methodBodyCache.insert({ rowIndex, resultMethodBody });
+			}
+			else
+			{
+				resultMethodBody = &tempMethodBody;
+			}
+			ReadMethodBody(*methodDef, methodData, *resultMethodBody);
+			return resultMethodBody;
 		}
 
 		// type index start from 0, difference with table index...
@@ -189,7 +218,7 @@ namespace metadata
 		const char* GetStringFromRawIndex(StringIndex index) const
 		{
 			IL2CPP_ASSERT(DecodeImageIndex(index) == 0);
-			return _rawImage.GetStringFromRawIndex(index);
+			return _rawImage->GetStringFromRawIndex(index);
 		}
 
 		uint32_t GetTypeRawIndex(const Il2CppTypeDefinition* typeDef) const
@@ -199,7 +228,7 @@ namespace metadata
 
 		uint32_t GetTypeRawIndexByEncodedIl2CppTypeIndex(int32_t il2cppTypeIndex) const
 		{
-			return GetTypeRawIndex((const Il2CppTypeDefinition*)_types[DecodeMetadataIndex(il2cppTypeIndex)].data.typeHandle);
+			return GetTypeRawIndex((const Il2CppTypeDefinition*)_types[DecodeMetadataIndex(il2cppTypeIndex)]->data.typeHandle);
 		}
 
 		const Il2CppTypeDefinition* GetTypeFromRawIndex(uint32_t index) const
@@ -211,13 +240,13 @@ namespace metadata
 		const Il2CppType* GetIl2CppTypeFromRawIndex(uint32_t index) const
 		{
 			IL2CPP_ASSERT((size_t)index < _types.size());
-			return &_types[index];
+			return _types[index];
 		}
 
 		const Il2CppType* GetIl2CppTypeFromRawTypeDefIndex(uint32_t index) override
 		{
 			IL2CPP_ASSERT(index < (uint32_t)_typeDetails.size());
-			return &_types[DecodeMetadataIndex(_typeDetails[index].typeDef->byvalTypeIndex)];
+			return _types[DecodeMetadataIndex(_typeDetails[index].typeDef->byvalTypeIndex)];
 		}
 
 		const Il2CppFieldDefinition* GetFieldDefinitionFromRawIndex(uint32_t index)
@@ -283,17 +312,27 @@ namespace metadata
 			return GetGenericContainerByTypeDefinition(&_typesDefines[typeDefIndex]);
 		}
 
-		const std::vector<MethodImpl>& GetTypeMethodImplByTypeDefinition(const Il2CppTypeDefinition* typeDef)
-		{
-			uint32_t index = (uint32_t)(typeDef - &_typesDefines[0]);
-			IL2CPP_ASSERT(index < (uint32_t)_typeDetails.size());
-			return _typeDetails[index].methodImpls;
-		}
+		const std::vector<MethodImpl>& GetTypeMethodImplByTypeDefinition(const Il2CppTypeDefinition* typeDef);
 
 		Il2CppType* GetGenericParameterConstraintFromIndex(GenericParameterConstraintIndex index)
 		{
 			IL2CPP_ASSERT((size_t)index < _genericConstraints.size());
-			return &_types[_genericConstraints[index]];
+			TypeIndex typeIndex = _genericConstraints[index];
+			if (typeIndex == kTypeIndexInvalid)
+			{
+
+				TbGenericParamConstraint data = _rawImage->ReadGenericParamConstraint(index + 1);
+				Il2CppGenericParameter& genericParam = _genericParams[data.owner - 1];
+				Il2CppType paramCons = {};
+
+				const Il2CppGenericContainer* klassGc;
+				const Il2CppGenericContainer* methodGc;
+				GetClassAndMethodGenericContainerFromGenericContainerIndex(genericParam.ownerIndex, klassGc, methodGc);
+
+				ReadTypeFromToken(klassGc, methodGc, DecodeTypeDefOrRefOrSpecCodedIndexTableType(data.constraint), DecodeTypeDefOrRefOrSpecCodedIndexRowIndex(data.constraint), paramCons);
+				_genericConstraints[index] = typeIndex = DecodeMetadataIndex(AddIl2CppTypeCache(paramCons));
+			}
+			return _types[typeIndex];
 		}
 
 		Il2CppClass* GetNestedTypeFromOffset(const Il2CppClass* klass, TypeNestedTypeIndex offset);
@@ -375,14 +414,14 @@ namespace metadata
 
 		const uint8_t* GetFieldOrParameterDefalutValueByRawIndex(uint32_t index)
 		{
-#if HYBRIDCLR_UNITY_2020
-			return _rawImage.GetFieldOrParameterDefalutValueByRawIndex(index);
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
+			return _rawImage->GetFieldOrParameterDefalutValueByRawIndex(index);
 #else
 			BlobSource source = (BlobSource)(index & 0x1);
 			uint32_t offset = index >> 1;
 			if (source == BlobSource::RAW_IMAGE)
 			{
-				return _rawImage.GetFieldOrParameterDefalutValueByRawIndex(offset);
+				return _rawImage->GetFieldOrParameterDefalutValueByRawIndex(offset);
 			}
 			else
 			{
@@ -414,6 +453,16 @@ namespace metadata
 			return { pd.name, getter, setter, pd.flags, EncodeToken(TableType::PROPERTY, rowIndex) };
 		}
 
+#ifdef HYBRIDCLR_UNITY_2019
+		const Il2CppEventDefinition* GetEventDefinitionFromIndex(EventIndex index)
+		{
+			IL2CPP_ASSERT(index > 0 && index <= (int32_t)_events.size());
+			EventDetail& pd = _events[index - 1];
+			return &pd.il2cppDefinition;
+		}
+#endif
+
+
 		Il2CppMetadataEventInfo GetEventInfo(const Il2CppClass* klass, TypeEventIndex index)
 		{
 			const Il2CppTypeDefinition* typeDef = (Il2CppTypeDefinition*)klass->typeMetadataHandle;
@@ -441,7 +490,7 @@ namespace metadata
 			return it != _tokenCustomAttributes.end() ? it->second.typeRangeIndex : kCustomAttributeIndexInvalid;
 		}
 
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 		std::tuple<void*, void*> GetCustomAttributeDataRange(uint32_t token)
 		{
 			const Il2CppCustomAttributeTypeRange* dataRangeCur = (const Il2CppCustomAttributeTypeRange*)GetCustomAttributeTypeToken(token);
@@ -449,7 +498,7 @@ namespace metadata
 			CustomAttributeIndex nextIndex = DecodeMetadataIndex(GET_CUSTOM_ATTRIBUTE_TYPE_RANGE_START(*(dataRangeCur + 1)));
 			CustomAttribute& curCa = _customAttribues[curIndex];
 			CustomAttribute& nextCa = _customAttribues[nextIndex];
-			return std::make_tuple<void*, void*>((void*)_rawImage.GetBlobReaderByRawIndex(curCa.value).GetData(), (void*)_rawImage.GetBlobReaderByRawIndex(nextCa.value).GetData());
+			return std::make_tuple<void*, void*>((void*)_rawImage->GetBlobReaderByRawIndex(curCa.value).GetData(), (void*)_rawImage->GetBlobReaderByRawIndex(nextCa.value).GetData());
 		}
 
 		CustomAttributesCache* GenerateCustomAttributesCacheInternal(const Il2CppCustomAttributeTypeRange* typeRange)
@@ -558,6 +607,7 @@ namespace metadata
 
 		Il2CppClass* GetTypeInfoFromTypeDefinitionRawIndex(uint32_t index);
 
+		const Il2CppType* GetInterfaceFromGlobalOffset(TypeInterfaceIndex offset);
 		const Il2CppType* GetInterfaceFromIndex(const Il2CppClass* klass, TypeInterfaceIndex index);
 		const Il2CppType* GetInterfaceFromOffset(const Il2CppClass* klass, TypeInterfaceIndex offset);
 		const Il2CppType* GetInterfaceFromOffset(const Il2CppTypeDefinition* typeDefine, TypeInterfaceIndex offset);
@@ -622,7 +672,7 @@ namespace metadata
 		Il2CppObject* ReadBoxedValue(BlobReader& reader);
 		void ReadFixedArg(BlobReader& reader, const Il2CppType* argType, void* data);
 		void ReadCustomAttributeFieldOrPropType(BlobReader& reader, Il2CppType& type);
-#if HYBRIDCLR_UNITY_2020
+#if !HYBRIDCLR_UNITY_2021_OR_NEW
 		void ConstructCustomAttribute(BlobReader& reader, Il2CppObject* obj, const MethodInfo* ctorMethod);
 #endif
 
@@ -635,14 +685,14 @@ namespace metadata
 		std::vector<Il2CppTypeDefinition> _typesDefines;
 		std::vector<Il2CppTypeDefinition> _exportedTypeDefines;
 
-		std::vector<Il2CppType> _types;
-		std::unordered_map<Il2CppType, uint32_t, Il2CppTypeHashShallow, Il2CppTypeEqualityComparerShallow> _type2Indexs;
+		std::vector<Il2CppType*> _types;
+		Il2CppHashMap<const Il2CppType*, uint32_t, Il2CppTypeHashShallow, Il2CppTypeEqualityComparerShallow> _type2Indexs;
 		std::vector<TypeIndex> _interfaceDefines;
 		std::vector<InterfaceOffsetInfo> _interfaceOffsets;
 
 		std::vector<const MethodInfo*> _methodDefine2InfoCaches;
 		std::vector<Il2CppMethodDefinition> _methodDefines;
-		std::vector<MethodBody> _methodBodies;
+		Il2CppHashMap<uint32_t, MethodBody*, il2cpp::utils::PassThroughHash<uint32_t>> _methodBodyCache;
 
 		std::vector<ParamDetail> _params;
 		std::vector<int32_t> _paramRawIndex2ActualParamIndex; // rawIindex = rowIndex - 1; because local function, param list count maybe less than actual method param count

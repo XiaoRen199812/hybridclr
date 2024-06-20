@@ -13,7 +13,7 @@
 
 #if HYBRIDCLR_UNITY_2020
 #include "icalls/mscorlib/System/MonoType.h"
-#elif HYBRIDCLR_UNITY_2021 || HYBRIDCLR_UNITY_2022
+#elif HYBRIDCLR_UNITY_2021_OR_NEW
 #include "icalls/mscorlib/System/RuntimeType.h"
 #include "icalls/mscorlib/System/RuntimeTypeHandle.h"
 #elif HYBRIDCLR_UNITY_2019
@@ -56,6 +56,28 @@
 #else
 #define HYBRIDCLR_ENABLE_WRITE_BARRIERS 0
 #endif
+
+
+#if UNITY_ENGINE_TUANJIE
+#define HYBRIDCLR_MALLOC(size) IL2CPP_MALLOC(size, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_MALLOC_ALIGNED(size, alignment) IL2CPP_MALLOC_ALIGNED(size, alignment, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_MALLOC_ZERO(size) IL2CPP_MALLOC_ZERO(size, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_CALLOC(count, size) IL2CPP_CALLOC(count, size, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_FREE(ptr) IL2CPP_FREE(ptr, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_FREE_ALIGNED(ptr) IL2CPP_FREE_ALIGNED(ptr, IL2CPP_MEM_META_POOL)
+#define HYBRIDCLR_METADATA_MALLOC(size) il2cpp::vm::MetadataMalloc(size, IL2CPP_MSTAT_TYPE)
+#define HYBRIDCLR_METADATA_CALLOC(count, size) il2cpp::vm::MetadataCalloc(count, size, IL2CPP_MSTAT_TYPE)
+#else
+#define HYBRIDCLR_MALLOC(size) IL2CPP_MALLOC(size)
+#define HYBRIDCLR_MALLOC_ALIGNED(size, alignment) IL2CPP_MALLOC_ALIGNED(size, alignment)
+#define HYBRIDCLR_MALLOC_ZERO(size) IL2CPP_MALLOC_ZERO(size)
+#define HYBRIDCLR_CALLOC(count, size) IL2CPP_CALLOC(count, size)
+#define HYBRIDCLR_FREE(ptr) IL2CPP_FREE(ptr)
+#define HYBRIDCLR_FREE_ALIGNED(ptr) IL2CPP_FREE_ALIGNED(ptr)
+#define HYBRIDCLR_METADATA_MALLOC(size) il2cpp::vm::MetadataMalloc(size)
+#define HYBRIDCLR_METADATA_CALLOC(count, size) il2cpp::vm::MetadataCalloc(count, size)
+#endif
+
 
 namespace hybridclr
 {
@@ -181,7 +203,7 @@ namespace hybridclr
 		return il2cpp::icalls::mscorlib::System::MonoType::getFullName(refType, false, false);
 	}
 }
-#elif HYBRIDCLR_UNITY_2021 || HYBRIDCLR_UNITY_2022
+#elif HYBRIDCLR_UNITY_2021_OR_NEW
 
 inline bool IS_CLASS_VALUE_TYPE(const Il2CppClass* klass)
 {
